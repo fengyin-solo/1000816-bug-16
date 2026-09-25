@@ -3,11 +3,11 @@
     <header class="page-head">
       <div>
         <h2>堆存计费管理</h2>
-        <p class="page-desc">维护计费单，围绕计费单号、关联箱号、计费周期、堆存天数做登记、筛选与状态流转。</p>
+        <p class="page-desc">按箱号与计费周期唯一计费；金额、堆存天数随周期与堆存记录统一核算，结清后锁定不可改。</p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记计费单</button>
-        <button class="btn" type="button" @click="exportRows">导出堆存计费清单</button>
+        <button class="btn" type="button" @click="exportRows">导出对账单</button>
       </div>
     </header>
 
@@ -19,9 +19,20 @@
     </div>
 
     <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+      <label class="filter-item">
+        <span>计费单号</span>
+        <input v-model="filters.keyword" placeholder="按计费单号检索" />
+      </label>
+      <label class="filter-item">
+        <span>关联箱号</span>
+        <input v-model="filters.container" placeholder="按箱号精确检索" />
+      </label>
+      <label class="filter-item">
+        <span>计费状态</span>
+        <select v-model="filters.status">
+          <option value="">全部状态</option>
+          <option v-for="status in statuses" :key="status" :value="status">{{ status }}</option>
+        </select>
       </label>
       <button class="btn" type="submit">查询</button>
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
@@ -38,15 +49,15 @@
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td class="row-actions">
-            <button
-              v-for="action in actions"
-              :key="action"
-              class="link"
-              type="button"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
+            <template v-if="row['已结清']">
+              <span class="locked-tag">已结清</span>
+            </template>
+            <template v-else>
+              <button class="link" type="button" @click="editRow(row)">修改</button>
+              <button class="link" type="button" @click="runAction(nextAction(row.status), row)">
+                {{ nextAction(row.status) }}
+              </button>
+            </template>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -67,42 +78,85 @@ import { onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, string | number | boolean | null>
 
 const ENDPOINT = '/api/storage'
 const columns = ["计费单号", "关联箱号", "计费周期", "堆存天数", "计费标准", "应收金额", "客户名称", "计费状态"]
-const actions = ["生成账单", "确认对账", "开具发票"]
 const statuses = ["待核算", "已核算", "已对账", "已开票"]
-const stats = [{"label": "待核算计费单", "value": 0}, {"label": "本月应收金额", "value": 0}, {"label": "已开票金额", "value": 0}]
+const nextActionByStatus: Record<string, string> = {
+  "待核算": "生成账单",
+  "已核算": "确认对账",
+  "已对账": "开具发票",
+}
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const filters = ref<Record<string, string>>({ keyword: '', container: '', status: '' })
+const stats = ref<{ label: string; value: number | string }[]>([
+  { label: "待核算计费单", value: 0 },
+  { label: "应收金额合计（元）", value: 0 },
+  { label: "已结清金额（元）", value: 0 },
+])
+
+function nextAction(status: string | number | boolean | null): string {
+  return nextActionByStatus[String(status)] ?? ''
+}
+
+function buildQuery(): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters.value)) {
+    if (value) params.set(key, value)
+  }
+  return params.toString()
+}
 
 function resetFilters() {
-  filters.value = {}
+  filters.value = { keyword: '', container: '', status: '' }
   void reload()
 }
 
 function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+  // 导出与列表使用同一接口的同一过滤口径，保证数字一致。
+  window.open(`${ENDPOINT}/export?${buildQuery()}`, '_blank')
 }
 
 function openCreate() {
   errorMessage.value = '计费单登记入口尚未接入审批流'
 }
 
+async function editRow(row: Row) {
+  errorMessage.value = ''
+  const period = window.prompt('修改计费周期（如 2026-09-01~2026-09-10 或 2026-09）', String(row['计费周期'] ?? ''))
+  if (period === null) return
+  const standard = window.prompt('修改计费标准（日费率，如 10 元/天）', String(row['计费标准'] ?? ''))
+  if (standard === null) return
+  try {
+    const response = await request(`${ENDPOINT}/${row.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ values: { 计费周期: period, 计费标准: standard } }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || '计费单未更新')
+    }
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '计费单更新失败'
+  }
+}
+
 async function runAction(action: string, row: Row) {
+  if (!action) return
   errorMessage.value = ''
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
       body: JSON.stringify({ action }),
     })
-    if (!response.ok) {
-      throw new Error('堆存计费动作未生效，请稍后重试')
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || '堆存计费动作未生效')
     }
     await reload()
   } catch (error) {
@@ -112,18 +166,32 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}?${buildQuery()}`)
     if (!response.ok) {
       throw new Error('计费单列表读取失败')
     }
     const payload = await response.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    await loadStats()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '堆存计费列表读取失败'
   }
+}
+
+async function loadStats() {
+  // 统计取全量（同一数据口径），不受当前页限制。
+  const response = await request(`${ENDPOINT}?size=200`)
+  if (!response.ok) return
+  const payload = await response.json()
+  const all = (payload.items ?? []) as Row[]
+  const amountOf = (list: Row[]) => list.reduce((sum, item) => sum + Number(item['应收金额'] || 0), 0)
+  stats.value = [
+    { label: "待核算计费单", value: all.filter((item) => item.status === '待核算').length },
+    { label: "应收金额合计（元）", value: amountOf(all).toFixed(2) },
+    { label: "已结清金额（元）", value: amountOf(all.filter((item) => item['已结清'])).toFixed(2) },
+  ]
 }
 
 onMounted(reload)

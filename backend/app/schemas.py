@@ -26,6 +26,7 @@ class EntryPayload(BaseModel):
 
     values: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
+    action: str | None = None
 
 
 
